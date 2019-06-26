@@ -1,5 +1,6 @@
 from gevent import monkey; monkey.patch_all()
 from uuid import uuid4
+import re
 import time, os, sys, inspect
 from pickle import loads as pickle_loads, dumps as pickle_dumps
 from dill import loads as dill_loads, dumps as dill_dumps
@@ -138,6 +139,15 @@ class TaskQueue:
         job = job_loads(activejob)
         return job
 
+    def _move_job_from_workq_to_worker_q(self, worker_q):
+        return self.r.brpoplpush(WORKQ, worker_q)
+
+    def get_worker_job_from_worker_queue(self, worker_q):
+        # if self.r.llen(ACTIVEQ) == 0:
+        activejob = self._move_job_from_workq_to_worker_q(worker_q)
+        job = job_loads(activejob)
+        return job
+
 def get_worker_last_seen_key_from_wid(worker_id):
     return "tq:{}-last_seen".format(worker_id)
 
@@ -152,9 +162,10 @@ class WorkerIdMixin:
     @property
     def worker_last_seen_key(self):
         return get_worker_last_seen_key_from_wid(self.worker_id)
-
-
-
+    
+    @property
+    def worker_queue_key(self):
+        return "tq:{}-queue".format(self.worker_id)
 
 class GeventWorker(WorkerIdMixin):
     def __init__(self, queue, greenlet=True):
@@ -186,7 +197,8 @@ class GeventWorker(WorkerIdMixin):
             g.sleep(1)
             jn += 1
             print("jn # ", jn)
-            job = self.q.get_worker_job()
+            # job = self.q.get_worker_job()
+            job = self.q.get_worker_job_from_worker_queue(self.worker_queue_key)
             job.worker_id = self.worker_id
             fn = job.getfn()
             args, kwargs = job.args, job.kwargs
@@ -250,20 +262,22 @@ class WorkersMgr:
     def _reaping_deadworkers(self):
         while True:
             print("reaping...")
-            for job_dumped in self.q.r.lrange(ACTIVEQ, 0, -1):
-                job = job_loads(job_dumped)
-                print("checking for job: ", job)
-                job_worker_id = job.worker_id
-                if job_worker_id is None:
-                    continue
-                last_seen_key = get_worker_last_seen_key_from_wid(job_worker_id)
-                last_seen = self.q.r.get(last_seen_key)
-                print("LAST SEEN FOR WORKER {} is {} ".format(job_worker_id, last_seen))
-                if time.time() - int(last_seen) > 2:
-                    print("WORKER {} is dead".format(job.worker_id))
-                    self.workers.pop(job.worker_id, None)
-                    job = prepare_to_reschedule(job)
-                    self.q.schedule(job)
+            worker_queues = self.q.r.keys("tq:worker*queue")
+            print("work queues", worker_queues)
+            for wq in worker_queues:
+                for job_dumped in self.q.r.lrange(wq, 0, -1):
+                    job = job_loads(job_dumped)
+                    print("checking for job: ", job)
+                    job_worker_id = re.search("tq:worker(.+)queue", wq.decode())
+                    last_seen_key = get_worker_last_seen_key_from_wid(job_worker_id)
+                    last_seen = self.q.r.get(last_seen_key)
+                    print("LAST SEEN FOR WORKER {} is {} ".format(job_worker_id, last_seen))
+                    if time.time() - int(last_seen) > 2:
+                        import ipdb; ipdb.set_trace()
+                        print("WORKER {} is dead".format(job.worker_id))
+                        self.workers.pop(job.worker_id, None)
+                        job = prepare_to_reschedule(job)
+                        self.q.schedule(job)
             sleep(1)
 
 def produce():
