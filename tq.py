@@ -148,9 +148,11 @@ class TaskQueue:
         job = job_loads(activejob)
         return job
 
+def get_worker_last_seen_key_from_uuid(worker_id):
+    return "tq:worker-{}-last_seen".format(worker_id)
+
 def get_worker_last_seen_key_from_wid(worker_id):
     return "tq:{}-last_seen".format(worker_id)
-
 class WorkerIdMixin:
 
     @property
@@ -243,7 +245,7 @@ class WorkersMgr:
         self.workers = {}
         self._workerclass = workerclass
         self.q = queue
-        self.WORKER_DEAD_TIMEOUT = 2 #  seconds.
+        self.WORKER_DEAD_TIMEOUT = 60 #  seconds.
         self.start_reaping_deadworkers()
 
 
@@ -268,12 +270,13 @@ class WorkersMgr:
                 for job_dumped in self.q.r.lrange(wq, 0, -1):
                     job = job_loads(job_dumped)
                     print("checking for job: ", job)
-                    job_worker_id = re.search("tq:worker(.+)queue", wq.decode())
-                    last_seen_key = get_worker_last_seen_key_from_wid(job_worker_id)
-                    last_seen = self.q.r.get(last_seen_key)
+                    job_worker_id = re.findall("tq:worker-(.+)?-queue" , wq.decode())[0]
+                    print(job_worker_id)
+                    last_seen_key = get_worker_last_seen_key_from_uuid(job_worker_id)
+                    last_seen = self.q.r.get(last_seen_key).decode()
+                    print("LAST SEEN KEY: ", last_seen_key)
                     print("LAST SEEN FOR WORKER {} is {} ".format(job_worker_id, last_seen))
-                    if time.time() - int(last_seen) > 2:
-                        import ipdb; ipdb.set_trace()
+                    if time.time() - float(last_seen) > WorkersMgr.WORKER_DEAD_TIMEOUT:
                         print("WORKER {} is dead".format(job.worker_id))
                         self.workers.pop(job.worker_id, None)
                         job = prepare_to_reschedule(job)
