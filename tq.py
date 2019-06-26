@@ -1,5 +1,5 @@
 from gevent import monkey; monkey.patch_all()
-
+from uuid import uuid4
 import time, os, sys, inspect
 from pickle import loads as pickle_loads, dumps as pickle_dumps
 from dill import loads as dill_loads, dumps as dill_dumps
@@ -12,16 +12,13 @@ from functools import partial
 import traceback
 
 STOPPED, SCHEDULED, RUNNING, SUCCESS, FAILURE = range(5)
-WORKQ = "jobs-work-q"
-ACTIVEQ = "jobs-active-q"
-ACKQ    = "jobs-ack-list"
+WORKQ = "tq:jobs-work-q"
+ACTIVEQ = "tq:jobs-active-q"
+ACKQ    = "tq:jobs-ack-list"
 
 class Job:
-    jid = 0
     def __init__(self, fun, retries=3):
-        self._jid = Job.jid
         self._job_id = None
-        Job.jid += 1
         self.fun = dill_dumps(fun)
         self.funname = fun.__name__
         self.retries = retries
@@ -38,11 +35,12 @@ class Job:
         self.in_process = False
         self.memoized = True
         self.timeout = 0
+        self.worker_id = None
 
     @property
     def job_id(self):
         if not self._job_id:
-            self._job_id = "{}-{}".format(time.time(), self._jid)
+            self._job_id = "job-{}".format(str(uuid4()))
         return self._job_id
 
     def getfn(self):
@@ -73,6 +71,10 @@ def job_to_success(job):
     now = time.time()
     job.last_modified_time = now
     job.done_time = now
+    return job
+
+def prepare_to_reschedule(job):
+    job.worker_id = None
     return job
 
 def job_set_result(job, value, redis_connection):
@@ -128,28 +130,41 @@ class TaskQueue:
         print(self.r.lpush(WORKQ, job_dumps(job)))
 
     def _move_job_from_workq_to_activeq(self):
-        self.r.brpoplpush(WORKQ, ACTIVEQ)
+        return self.r.brpoplpush(WORKQ, ACTIVEQ)
 
     def get_worker_job(self):
-        if self.r.llen(ACTIVEQ) == 0:
-            self._move_job_from_workq_to_activeq()
-        activejob = self.r.lpop(ACTIVEQ)
+        # if self.r.llen(ACTIVEQ) == 0:
+        activejob = self._move_job_from_workq_to_activeq()
         job = job_loads(activejob)
         return job
 
-class BaseWorker:
-    wid = 0
+def get_worker_last_seen_key_from_wid(worker_id):
+    return "tq:{}-last_seen".format(worker_id)
 
-class GeventWorker(BaseWorker):
+class WorkerIdMixin:
+
+    @property
+    def worker_id(self):
+        if not self._worker_id:
+            self._worker_id = "worker-{}".format(str(uuid4()))
+        return self._worker_id
+    
+    @property
+    def worker_last_seen_key(self):
+        return get_worker_last_seen_key_from_wid(self.worker_id)
+
+
+
+
+class GeventWorker(WorkerIdMixin):
     def __init__(self, queue, greenlet=True):
         self.q = queue
-        self.wid = BaseWorker.wid + 1
-        BaseWorker.wid += 1
         self.greenlet = greenlet
+        self._worker_id = None
 
     def work(self):
         jn = 0
-        print("Starting worker")
+        print("Starting worker: # ", self.worker_id)
         def execute_job_in_greenlet(job):
             fn = job.getfn()
             args = job.args
@@ -167,9 +182,12 @@ class GeventWorker(BaseWorker):
                     self.on_job_error(job, None)
 
         while True:
+            self.q.r.set(self.worker_last_seen_key, time.time())
+            g.sleep(1)
             jn += 1
             print("jn # ", jn)
             job = self.q.get_worker_job()
+            job.worker_id = self.worker_id
             fn = job.getfn()
             args, kwargs = job.args, job.kwargs
             print("executing fun: {} and memoized {}".format(job.funname, job.memoized))
@@ -191,6 +209,8 @@ class GeventWorker(BaseWorker):
                     job = job_to_success(job)
                     job_set_result(job, res, self.q.r)
                     # remember cache key.
+            
+
 
     def on_job_error(self, job, g):
         print("[-] Job failed\n", job)
@@ -211,48 +231,84 @@ class WorkersMgr:
         self.workers = {}
         self._workerclass = workerclass
         self.q = queue
+        self.WORKER_DEAD_TIMEOUT = 2 #  seconds.
+        self.start_reaping_deadworkers()
+
+
     def new_worker(self):
         w = self._workerclass(self.q)
-        self.workers[w.wid] = w
+        self.workers[w.worker_id] = w
         return w
     
     def start_new_worker(self):
         w = self.new_worker()
         return g.spawn(w.work)
+    
+    def start_reaping_deadworkers(self):
+        return g.spawn(self._reaping_deadworkers)
+    
+    def _reaping_deadworkers(self):
+        while True:
+            print("reaping...")
+            for job_dumped in self.q.r.lrange(ACTIVEQ, 0, -1):
+                job = job_loads(job_dumped)
+                print("checking for job: ", job)
+                job_worker_id = job.worker_id
+                if job_worker_id is None:
+                    continue
+                last_seen_key = get_worker_last_seen_key_from_wid(job_worker_id)
+                last_seen = self.q.r.get(last_seen_key)
+                print("LAST SEEN FOR WORKER {} is {} ".format(job_worker_id, last_seen))
+                if time.time() - int(last_seen) > 2:
+                    print("WORKER {} is dead".format(job.worker_id))
+                    self.workers.pop(job.worker_id, None)
+                    job = prepare_to_reschedule(job)
+                    self.q.schedule(job)
+            sleep(1)
 
 def produce():
     q = TaskQueue()
 
-    def longfn1():
-        sleep(0)
-        return "ok"
-    bglongfn1 = new_job(longfn1)
-    q.schedule(bglongfn1)
+    # def longfn1():
+    #     sleep(0)
+    #     return "ok"
+    # bglongfn1 = new_job(longfn1)
+    # q.schedule(bglongfn1)
 
-    def longfn2(username, lang="en"):
-        sleep(0)
-        print("hi ", username, lang)
-        return username, lang
+    # def longfn2(username, lang="en"):
+    #     sleep(0)
+    #     print("hi ", username, lang)
+    #     return username, lang
 
-    # # bglongfn2 = new_job(longfn2)
-    q.schedule_fun(longfn2, username="ahmed", lang="en")
+    # # # bglongfn2 = new_job(longfn2)
+    # q.schedule_fun(longfn2, username="ahmed", lang="en")
 
-    def fail1():
-        sleep(1)
-        raise ValueError("errr")
+    # def fail1():
+    #     sleep(1)
+    #     raise ValueError("errr")
     
-    q.schedule_fun(fail1)
+    # q.schedule_fun(fail1)
 
-    def fail2Timeout():
-        sleep(5)
+    # def fail2Timeout():
+    #     sleep(5)
 
-    failingjob = new_job(fail2Timeout)
-    failingjob.timeout = 1
-    q.schedule(failingjob)
+    # failingjob1 = new_job(fail2Timeout)
+    # failingjob1.timeout = 1
+    # q.schedule(failingjob1)
 
 
+    def fail3Timeout():
+        for i in range(10):
+            print("a very long job")
+            sleep(1)
 
-    q.schedule_fun(longfn2, username="dmdm", lang="ar")
+    failingjob2 = new_job(fail3Timeout)
+    failingjob2.timeout = 40
+    failingjob2.in_process = True
+    failingjob2.memoized = False
+    q.schedule(failingjob2)
+
+    # q.schedule_fun(longfn2, username="dmdm", lang="ar")
 
 if __name__ == "__main__":
     q = TaskQueue()
@@ -264,6 +320,13 @@ if __name__ == "__main__":
             count = int(argv[2])
         for i in range(count):
             produce()
+    elif argv[1] == "producemany":
+        count = 100
+        if len(argv) > 2:
+            count = int(argv[2])
+        for i in range(count):
+            produce()
+            sleep(1)
     elif argv[1] == "worker":
         wm = WorkersMgr(GeventWorker, q)
         nworkers = 4
