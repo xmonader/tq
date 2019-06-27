@@ -13,9 +13,8 @@ from functools import partial
 import traceback
 
 STOPPED, SCHEDULED, RUNNING, SUCCESS, FAILURE = range(5)
-WORKQ = "tq:jobs-work-q"
-ACTIVEQ = "tq:jobs-active-q"
-ACKQ    = "tq:jobs-ack-list"
+WAITING_Q = "tq:queue:waiting-jobs"
+WORKER_QUEUE_ID_PATTERN = "tq:queue:worker-(.+)?"
 
 class Job:
     def __init__(self, fun, retries=3):
@@ -23,11 +22,9 @@ class Job:
         self.fun = dill_dumps(fun)
         self.funname = fun.__name__
         self.retries = retries
-        self.state = SCHEDULED
+        self.state = STOPPED
         self.args = []
         self.kwargs = {}
-        self.jobkey_cached = "jobs-results:cache-{}".format(self._hash())
-        self.jobkey = "job-results:job-{}".format(self.job_id)
         self.result = None
         self.error = None
         self.start_time = None
@@ -38,11 +35,24 @@ class Job:
         self.timeout = 0
         self.worker_id = None
 
+
+    @property
+    def job_result_key(self):
+        return "tq:results:{}".format(self.job_id)
+
+    @property
+    def job_result_key_cached(self):
+        return "tq:cache-results:{}".format(self._hash())
+    
     @property
     def job_id(self):
         if not self._job_id:
-            self._job_id = "job-{}".format(str(uuid4()))
+            self._job_id = "{}".format(str(uuid4()))
         return self._job_id
+
+    @property
+    def job_key(self):
+        return "tq:job:{}".format(self.job_id)
 
     def getfn(self):
         return dill_loads(self.fun)
@@ -61,50 +71,6 @@ class Job:
     
     __repr__ = __str__
 
-def job_dumps(job):
-    return dill_dumps(job)
-
-def job_loads(data):
-    return dill_loads(data)
-
-def job_to_success(job):
-    job.state = SUCCESS
-    now = time.time()
-    job.last_modified_time = now
-    job.done_time = now
-    return job
-
-def prepare_to_reschedule(job):
-    job.worker_id = None
-    return job
-
-def job_set_result(job, value, redis_connection):
-    job.result = value
-    print("setting result to : ", value)
-    dumped_value = dill_dumps(value)
-    redis_connection.set(job.jobkey, dumped_value)
-    redis_connection.set(job.jobkey_cached, dumped_value)
-    return job
-
-def job_get_result(job, redis_connection):
-    val = None
-    try:
-        if job.memoized and redis_connection.exists(job.jobkey_cached):
-            val = dill_loads(redis_connection.get(job.jobkey_cached))
-        else:
-            val = dill_loads(redis_connection.get(job.jobkey))
-    except Exception as e:
-        print("[-] error getting job result: ", e)
-    return val
-
-def job_to_failure(job):
-    job.retries -= 1
-    job.state = FAILURE
-    job.error = str(traceback.format_exc())
-    job.last_modified_time = time.time()
-    return job
-
-
 def new_job(fun, *args, **kwargs):
     job = Job(fun=fun)
     job.state = STOPPED
@@ -119,7 +85,8 @@ def on_error(job):
 def on_success(job):
     print("success: ", job)
 
-class TaskQueue:
+
+class TaskQueueManager:
     def __init__(self):
         self.r = Redis()
 
@@ -128,52 +95,114 @@ class TaskQueue:
     
     def schedule(self, job):
         job.state = SCHEDULED
-        print(self.r.lpush(WORKQ, job_dumps(job)))
+        self.job_save(job)
+        print(self.r.lpush(WAITING_Q, job.job_key))
 
-    def _move_job_from_workq_to_activeq(self):
-        return self.r.brpoplpush(WORKQ, ACTIVEQ)
 
-    def get_worker_job(self):
-        # if self.r.llen(ACTIVEQ) == 0:
-        activejob = self._move_job_from_workq_to_activeq()
-        job = job_loads(activejob)
-        return job
-
-    def _move_job_from_workq_to_worker_q(self, worker_q):
-        return self.r.brpoplpush(WORKQ, worker_q)
+    def _move_job_from_waiting_q_to_worker_q(self, worker_q):
+        return self.r.brpoplpush(WAITING_Q, worker_q)
 
     def get_worker_job_from_worker_queue(self, worker_q):
-        # if self.r.llen(ACTIVEQ) == 0:
-        activejob = self._move_job_from_workq_to_worker_q(worker_q)
-        job = job_loads(activejob)
+        activejob = self._move_job_from_waiting_q_to_worker_q(worker_q)
+        return activejob
+    
+    def job_dumps(self, job):
+        return dill_dumps(job)
+
+    def job_loads(self, data):
+        return dill_loads(data)
+
+    def job_to_success(self, job):
+        job.state = SUCCESS
+        now = time.time()
+        job.last_modified_time = now
+        job.done_time = now
         return job
 
-def get_worker_last_seen_key_from_uuid(worker_id):
-    return "tq:worker-{}-last_seen".format(worker_id)
+    def prepare_to_reschedule(self, job):
+        job.worker_id = None
+        return job
 
-def get_worker_last_seen_key_from_wid(worker_id):
-    return "tq:{}-last_seen".format(worker_id)
+    def job_set_result(self, job, value):
+        job.result = value
+        print("setting result to : ", value)
+        dumped_value = dill_dumps(value)
+        self.r.set(job.job_result_key, dumped_value)
+        self.r.set(job.job_result_key_cached, dumped_value)
+        return job
+
+    def job_get_result(self, job):
+        val = None
+        try:
+            if job.memoized and self.r.exists(job.job_result_key_cached):
+                val = dill_loads(self.r.get(job.job_result_key_cached))
+            else:
+                val = dill_loads(self.r.get(job.job_result_key))
+        except Exception as e:
+            print("[-] error getting job result: ", e)
+        return val
+
+    def job_save(self, job):
+        self.r.set(job.job_key, self.job_dumps(job))
+
+    def job_get(self, job_key):
+        return self.job_loads(self.r.get(job_key))
+
+    def job_to_failure(self, job):
+        job.retries -= 1
+        job.state = FAILURE
+        job.error = str(traceback.format_exc())
+        job.last_modified_time = time.time()
+        return job
+
+
+    def clean_job_from_worker_queue(self, jobkey, worker_queue):
+        self.r.lrem(worker_queue, jobkey)
+
+    def get_jobs_of_worker(self, worker_id):
+        return self.r.lrange("tq:queue:worker:{}".format(worker_id), 0, -1)
+
+    def get_jobs_of_worker_queue(self, worker_queue):
+        return self.r.lrange(worker_queue, 0, -1)
+
+    def get_all_jobs_keys(self):
+        return self.r.keys("tq:job:*")
+
+    def get_worker_queues(self):
+        return self.r.keys("tq:queue:worker*")
+
+    def get_worker_last_seen(self, worker_id):
+        last_seen_key = "tq:worker-{}-last_seen".format(worker_id)
+        last_seen = self.tm.r.get(last_seen_key).decode()
+        return last_seen
+
 class WorkerIdMixin:
 
     @property
     def worker_id(self):
         if not self._worker_id:
-            self._worker_id = "worker-{}".format(str(uuid4()))
+            self._worker_id = str(uuid4())
         return self._worker_id
     
     @property
     def worker_last_seen_key(self):
-        return get_worker_last_seen_key_from_wid(self.worker_id)
+        return "tq:worker-{}-last_seen".format(self.worker_id)
     
     @property
     def worker_queue_key(self):
-        return "tq:{}-queue".format(self.worker_id)
+        return "tq:queue:worker-{}".format(self.worker_id)
+
+
+
 
 class GeventWorker(WorkerIdMixin):
-    def __init__(self, queue, greenlet=True):
-        self.q = queue
+    def __init__(self, taskqueuemanager, greenlet=True):
+        self.tm= taskqueuemanager
         self.greenlet = greenlet
         self._worker_id = None
+
+    def send_heartbeat(self):
+        self.tm.r.set(self.worker_last_seen_key, time.time())
 
     def work(self):
         jn = 0
@@ -184,6 +213,8 @@ class GeventWorker(WorkerIdMixin):
             kwargs = job.kwargs
             if job.timeout == 0:
                 f = g.spawn(fn, *args, **kwargs)
+                f.link_exception(partial(self.on_job_error, job))
+                f.link_value(partial(self.on_job_success, job))
             else:
                 print("executing with timeout: ", )
                 try:
@@ -193,65 +224,73 @@ class GeventWorker(WorkerIdMixin):
                 except g.Timeout as e:
                     print("timeout happened.")
                     self.on_job_error(job, None)
+            self.tm.job_save(job)
 
         while True:
-            self.q.r.set(self.worker_last_seen_key, time.time())
+            self.send_heartbeat()
             g.sleep(1)
             jn += 1
             print("jn # ", jn)
-            # job = self.q.get_worker_job()
-            job = self.q.get_worker_job_from_worker_queue(self.worker_queue_key)
+            jobkey = self.tm.get_worker_job_from_worker_queue(self.worker_queue_key)
+            if not jobkey:
+                continue
+            job = self.tm.job_get(jobkey)
             job.worker_id = self.worker_id
+            job.state = RUNNING
+            self.tm.job_save(job)
             fn = job.getfn()
             args, kwargs = job.args, job.kwargs
             print("executing fun: {} and memoized {}".format(job.funname, job.memoized))
-            if job.memoized and self.q.r.exists(job.jobkey_cached):
-                val = job_get_result(job, self.q.r)
-                job = job_to_success(job)
-                job = job_set_result(job, val, self.q.r)
+            if job.memoized and self.tm.r.exists(job.job_result_key_cached):
+                val = self.tm.job_get_result(job)
+                job = self.tm.job_to_success(job)
+                job = self.tm.job_set_result(job, val)
+                self.tm.job_save(job)
                 continue 
-            
-            if self.greenlet and not job.in_process:
-                execute_job_in_greenlet(job)
             else:
-                try:
-                    res = fn(*args, **kwargs)
-                except Exception as e:
-                    print("[-]Exception in worker: ", e)
-                    self.on_job_error(job, None)
+                if self.greenlet and not job.in_process:
+                    execute_job_in_greenlet(job)
                 else:
-                    job = job_to_success(job)
-                    job_set_result(job, res, self.q.r)
-                    # remember cache key.
-            
+                    try:
+                        res = fn(*args, **kwargs)
+                    except Exception as e:
+                        print("[-]Exception in worker: ", e)
+                        self.on_job_error(job, None)
 
+                    else:
+                        job = self.tm.job_to_success(job)
+                        self.tm.job_set_result(job, res)
+                        self.tm.job_save(job)
+                        # remember cache key.
 
     def on_job_error(self, job, g):
         print("[-] Job failed\n", job)
-        job = job_to_failure(job)
+        job = self.tm.job_to_failure(job)
+        self.tm.job_save(job)
         if job.retries > 0:
             print("Scheduling again for retry")
-            self.q.schedule(job)
+            self.tm.schedule(job)
 
     def on_job_success(self, job, g):
-        job = job_to_success(job)
+        job = self.tm.job_to_success(job)
         print("[+] Job succeeded\n", job)
         value = g.value
         print(value)
-        job_set_result(job, value, self.q.r)
+        self.tm.job_set_result(job, value)
+        self.tm.job_save(job)
 
+    
 class WorkersMgr:
-    def __init__(self, workerclass, queue):
-        self.workers = {}
+    WORKER_DEAD_TIMEOUT = 60 # seconds
+    def __init__(self, workerclass, taskqueuemanager):
         self._workerclass = workerclass
-        self.q = queue
-        self.WORKER_DEAD_TIMEOUT = 60 #  seconds.
+        self.tm= taskqueuemanager
         self.start_reaping_deadworkers()
+        self.start_cleaning_jobs()
 
 
     def new_worker(self):
-        w = self._workerclass(self.q)
-        self.workers[w.worker_id] = w
+        w = self._workerclass(self.tm)
         return w
     
     def start_new_worker(self):
@@ -261,50 +300,69 @@ class WorkersMgr:
     def start_reaping_deadworkers(self):
         return g.spawn(self._reaping_deadworkers)
     
+    def start_cleaning_jobs(self):
+        return g.spawn(self._clean_jobs)
+
+    def _clean_jobs(self):
+        while True:
+            print("cleaning jobs....")
+            jobkeys = self.tm.get_all_jobs_keys()
+            for jobkey in jobkeys:
+                job = self.tm.job_get(jobkey)
+                if job.state == SUCCESS or (job.retries == 0 and job.state == FAILURE):
+                    print("[INFO] job completed .. cleaning up the {} job".format(jobkey))
+                    self.tm.r.delete(jobkey)
+            g.sleep(1)
+        
     def _reaping_deadworkers(self):
         while True:
             print("reaping...")
-            worker_queues = self.q.r.keys("tq:worker*queue")
+            worker_queues = self.tm.get_worker_queues()
             print("work queues", worker_queues)
+            
+
             for wq in worker_queues:
-                for job_dumped in self.q.r.lrange(wq, 0, -1):
-                    job = job_loads(job_dumped)
-                    print("checking for job: ", job)
-                    job_worker_id = re.findall("tq:worker-(.+)?-queue" , wq.decode())[0]
+                for jobkey in self.tm.get_jobs_of_worker(wq):
+                    job = self.tm.job_get(jobkey)
+                    print("JOB STATE: ", job.state)
+                    if job.state == SUCCESS or (job.retries == 0 and job.state == FAILURE):
+                        print("[INFO] job completed .. cleaning up the {} queue".format(wq))
+                        self.tm.clean_job_from_worker_queue(jobkey, wq)
+
+                    job_worker_id = re.findall(WORKER_QUEUE_ID_PATTERN , wq.decode())[0]
                     print(job_worker_id)
-                    last_seen_key = get_worker_last_seen_key_from_uuid(job_worker_id)
-                    last_seen = self.q.r.get(last_seen_key).decode()
-                    print("LAST SEEN KEY: ", last_seen_key)
+
+                    last_seen = self.tm.get_worker_last_seen(job_worker_id)
                     print("LAST SEEN FOR WORKER {} is {} ".format(job_worker_id, last_seen))
                     if time.time() - float(last_seen) > WorkersMgr.WORKER_DEAD_TIMEOUT:
                         print("WORKER {} is dead".format(job.worker_id))
-                        self.workers.pop(job.worker_id, None)
-                        job = prepare_to_reschedule(job)
-                        self.q.schedule(job)
+                        job = self.tm.prepare_to_reschedule(job)
+                        self.tm.schedule(job)
             sleep(1)
 
 def produce():
-    q = TaskQueue()
+    q = TaskQueueManager()
 
-    # def longfn1():
-    #     sleep(0)
-    #     return "ok"
-    # bglongfn1 = new_job(longfn1)
-    # q.schedule(bglongfn1)
+    def longfn1():
+        sleep(1)
+        return "ok"
+    bglongfn1 = new_job(longfn1)
+    q.schedule(bglongfn1)
 
-    # def longfn2(username, lang="en"):
-    #     sleep(0)
-    #     print("hi ", username, lang)
-    #     return username, lang
+    def longfn2(username, lang="en"):
+        sleep(0)
+        print("hi ", username, lang)
+        return username, lang
 
-    # # # bglongfn2 = new_job(longfn2)
-    # q.schedule_fun(longfn2, username="ahmed", lang="en")
+    # # bglongfn2 = new_job(longfn2)
+    q.schedule_fun(longfn2, username="ahmed", lang="en")
+    q.schedule_fun(longfn2, username="dmdm", lang="ar")
 
-    # def fail1():
-    #     sleep(1)
-    #     raise ValueError("errr")
+    def fail1():
+        sleep(1)
+        raise ValueError("errr")
     
-    # q.schedule_fun(fail1)
+    q.schedule_fun(fail1)
 
     # def fail2Timeout():
     #     sleep(5)
@@ -314,21 +372,20 @@ def produce():
     # q.schedule(failingjob1)
 
 
-    def fail3Timeout():
-        for i in range(10):
-            print("a very long job")
-            sleep(1)
+    # def fail3Timeout():
+    #     for i in range(5):
+    #         print("a very long job")
+    #         sleep(1)
 
-    failingjob2 = new_job(fail3Timeout)
-    failingjob2.timeout = 40
-    failingjob2.in_process = True
-    failingjob2.memoized = False
-    q.schedule(failingjob2)
+    # failingjob2 = new_job(fail3Timeout)
+    # failingjob2.timeout = 40
+    # failingjob2.in_process = True
+    # failingjob2.memoized = False
+    # q.schedule(failingjob2)
 
-    # q.schedule_fun(longfn2, username="dmdm", lang="ar")
 
 if __name__ == "__main__":
-    q = TaskQueue()
+    tm = TaskQueueManager()
 
     argv = sys.argv
     if argv[1] == "producer":
@@ -345,7 +402,7 @@ if __name__ == "__main__":
             produce()
             sleep(1)
     elif argv[1] == "worker":
-        wm = WorkersMgr(GeventWorker, q)
+        wm = WorkersMgr(GeventWorker, tm)
         nworkers = 4
         if len(argv) > 2:
             nworkers = argv[2]
@@ -356,3 +413,10 @@ if __name__ == "__main__":
         g.joinall(futures, raise_error=False)
     elif argv[1] == "clean":
         q.r.flushall()
+    elif argv[1] == "info":
+        jobskeys = tm.get_all_jobs_keys()
+        print("Jobs: ", len(jobskeys))
+        print("Job #\t\t\t\t\t\t State\t\t Retries ")
+        for jobkey in jobskeys:
+            job = tm.job_get(jobkey)
+            print(job.job_key, "\t", job.state, "\t\t", job.retries)
