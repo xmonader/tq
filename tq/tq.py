@@ -1,18 +1,25 @@
 from gevent import monkey; monkey.patch_all()
+import gevent as g
+from gevent import sleep
 from uuid import uuid4
 import re
 import time, os, sys, inspect
 from pickle import loads as pickle_loads, dumps as pickle_dumps
 from dill import loads as dill_loads, dumps as dill_dumps
 from redis import Redis
-import gevent as g
-from gevent import sleep
 from hashlib import md5
 from base64 import b64encode, b64decode
 from functools import partial
 import traceback
+import enum
 
-STOPPED, SCHEDULED, RUNNING, SUCCESS, FAILURE = range(5)
+class JobState(enum.Enum):
+    STOPPED = "STOPPED"
+    SCHEDULED = "SCHEDULED"
+    RUNNING = "RUNNING" 
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+ 
 WAITING_Q = "tq:queue:waiting-jobs"
 WORKER_QUEUE_ID_PATTERN = "tq:queue:worker-(.+)?"
 
@@ -20,9 +27,9 @@ class Job:
     def __init__(self, fun, retries=3):
         self._job_id = None
         self.fun = dill_dumps(fun)
-        self.funname = fun.__name__
+        self.fun_name = fun.__name__
         self.retries = retries
-        self.state = STOPPED
+        self.state = JobState.STOPPED
         self.args = []
         self.kwargs = {}
         self.result = None
@@ -34,6 +41,7 @@ class Job:
         self.memoized = True
         self.timeout = 0
         self.worker_id = None
+        self.safe_to_collect = False
 
 
     @property
@@ -62,7 +70,14 @@ class Job:
         thehash = md5()
         thehash.update(data.encode())
         return thehash.hexdigest()
+
+    def is_done(self):
+        return self.state in [JobState.SUCCESS, JobState.FAILURE]
     
+    def is_safe_to_collect(self):
+        return self.safe_to_collect and self.state == JobState.SUCCESS or (self.retries == 0 and self.state == JobState.FAILURE)
+
+
     def __call__(self):
         return self
     
@@ -73,7 +88,7 @@ class Job:
 
 def new_job(fun, *args, **kwargs):
     job = Job(fun=fun)
-    job.state = STOPPED
+    job.state = JobState.STOPPED
     job.args = args
     job.kwargs = kwargs
 
@@ -85,7 +100,6 @@ def on_error(job):
 def on_success(job):
     print("success: ", job)
 
-
 class TaskQueueManager:
     def __init__(self):
         self.r = Redis()
@@ -94,10 +108,10 @@ class TaskQueueManager:
         return self.schedule(new_job(fun, *args, **kwargs))
     
     def schedule(self, job):
-        job.state = SCHEDULED
-        self.job_save(job)
+        job.state = JobState.SCHEDULED
+        self.save_job(job)
         print(self.r.lpush(WAITING_Q, job.job_key))
-
+        return job
 
     def _move_job_from_waiting_q_to_worker_q(self, worker_q):
         return self.r.brpoplpush(WAITING_Q, worker_q)
@@ -113,7 +127,7 @@ class TaskQueueManager:
         return dill_loads(data)
 
     def job_to_success(self, job):
-        job.state = SUCCESS
+        job.state = JobState.SUCCESS
         now = time.time()
         job.last_modified_time = now
         job.done_time = now
@@ -123,15 +137,31 @@ class TaskQueueManager:
         job.worker_id = None
         return job
 
-    def job_set_result(self, job, value):
+    def set_job_result(self, job, value):
         job.result = value
         print("setting result to : ", value)
         dumped_value = dill_dumps(value)
         self.r.set(job.job_result_key, dumped_value)
         self.r.set(job.job_result_key_cached, dumped_value)
+        self.save_job(job)
         return job
 
-    def job_get_result(self, job):
+    def get_job_result_from_redis(self, job):
+        try:
+            if self.r.exists(job.job_result_key_cached):
+                val = dill_loads(self.r.get(job.job_result_key_cached))
+            else:
+                val = dill_loads(self.r.get(job.job_result_key))
+        except Exception as e:
+            raise e
+
+    def get_job_result(self, job, raise_exception=False):
+        if raise_exception and job.state == JobState.FAILURE:
+            job.safe_to_collect = True
+            self.save_job(job)
+            raise RuntimeError(job.error)
+
+        job = tm.get_job(job.job_key)
         val = None
         try:
             if job.memoized and self.r.exists(job.job_result_key_cached):
@@ -140,21 +170,33 @@ class TaskQueueManager:
                 val = dill_loads(self.r.get(job.job_result_key))
         except Exception as e:
             print("[-] error getting job result: ", e)
+        job.safe_to_collect = True
+        self.save_job(job)
         return val
+    
+    def wait_job(self, job):
+        job = tm.get_job(job.job_key)
 
-    def job_save(self, job):
+        while True:
+            if job.state in [JobState.SUCCESS, JobState.FAILURE]:
+                break
+            job = tm.get_job(job.job_key)
+            print(job.state, job.job_key)
+
+            sleep(1)
+
+    def save_job(self, job):
         self.r.set(job.job_key, self.job_dumps(job))
 
-    def job_get(self, job_key):
+    def get_job(self, job_key):
         return self.job_loads(self.r.get(job_key))
 
     def job_to_failure(self, job):
         job.retries -= 1
-        job.state = FAILURE
+        job.state = JobState.FAILURE
         job.error = str(traceback.format_exc())
         job.last_modified_time = time.time()
         return job
-
 
     def clean_job_from_worker_queue(self, jobkey, worker_queue):
         self.r.lrem(worker_queue, jobkey)
@@ -224,7 +266,7 @@ class GeventWorker(WorkerIdMixin):
                 except g.Timeout as e:
                     print("timeout happened.")
                     self.on_job_error(job, None)
-            self.tm.job_save(job)
+            # self.tm.save_job(job)
 
         while True:
             self.send_heartbeat()
@@ -234,18 +276,19 @@ class GeventWorker(WorkerIdMixin):
             jobkey = self.tm.get_worker_job_from_worker_queue(self.worker_queue_key)
             if not jobkey:
                 continue
-            job = self.tm.job_get(jobkey)
+            job = self.tm.get_job(jobkey)
             job.worker_id = self.worker_id
-            job.state = RUNNING
-            self.tm.job_save(job)
+            job.state = JobState.RUNNING
+            job.start_time = time.time()
+            self.tm.save_job(job)
             fn = job.getfn()
             args, kwargs = job.args, job.kwargs
-            print("executing fun: {} and memoized {}".format(job.funname, job.memoized))
+            print("executing fun: {} and memoized {}".format(job.fun_name, job.memoized))
             if job.memoized and self.tm.r.exists(job.job_result_key_cached):
-                val = self.tm.job_get_result(job)
+                val = self.tm.get_job_result(job)
                 job = self.tm.job_to_success(job)
-                job = self.tm.job_set_result(job, val)
-                self.tm.job_save(job)
+                job = self.tm.set_job_result(job, val)
+                self.tm.save_job(job)
                 continue 
             else:
                 if self.greenlet and not job.in_process:
@@ -259,14 +302,14 @@ class GeventWorker(WorkerIdMixin):
 
                     else:
                         job = self.tm.job_to_success(job)
-                        self.tm.job_set_result(job, res)
-                        self.tm.job_save(job)
+                        self.tm.set_job_result(job, res)
+                        self.tm.save_job(job)
                         # remember cache key.
 
     def on_job_error(self, job, g):
         print("[-] Job failed\n", job)
         job = self.tm.job_to_failure(job)
-        self.tm.job_save(job)
+        self.tm.save_job(job)
         if job.retries > 0:
             print("Scheduling again for retry")
             self.tm.schedule(job)
@@ -276,17 +319,18 @@ class GeventWorker(WorkerIdMixin):
         print("[+] Job succeeded\n", job)
         value = g.value
         print(value)
-        self.tm.job_set_result(job, value)
-        self.tm.job_save(job)
+        self.tm.set_job_result(job, value)
+        self.tm.save_job(job)
 
     
 class WorkersMgr:
     WORKER_DEAD_TIMEOUT = 60 # seconds
-    def __init__(self, workerclass, taskqueuemanager):
+    def __init__(self, workerclass, taskqueuemanager, cleanjobs=False):
         self._workerclass = workerclass
         self.tm= taskqueuemanager
         self.start_reaping_deadworkers()
-        self.start_cleaning_jobs()
+        if cleanjobs:
+            self.start_cleaning_jobs()
 
 
     def new_worker(self):
@@ -308,8 +352,8 @@ class WorkersMgr:
             print("cleaning jobs....")
             jobkeys = self.tm.get_all_jobs_keys()
             for jobkey in jobkeys:
-                job = self.tm.job_get(jobkey)
-                if job.state == SUCCESS or (job.retries == 0 and job.state == FAILURE):
+                job = self.tm.get_job(jobkey)
+                if job.is_safe_to_collect():
                     print("[INFO] job completed .. cleaning up the {} job".format(jobkey))
                     self.tm.r.delete(jobkey)
             g.sleep(1)
@@ -320,12 +364,11 @@ class WorkersMgr:
             worker_queues = self.tm.get_worker_queues()
             print("work queues", worker_queues)
             
-
             for wq in worker_queues:
                 for jobkey in self.tm.get_jobs_of_worker(wq):
-                    job = self.tm.job_get(jobkey)
+                    job = self.tm.get_job(jobkey)
                     print("JOB STATE: ", job.state)
-                    if job.state == SUCCESS or (job.retries == 0 and job.state == FAILURE):
+                    if job.is_safe_to_collect():
                         print("[INFO] job completed .. cleaning up the {} queue".format(wq))
                         self.tm.clean_job_from_worker_queue(jobkey, wq)
 
@@ -334,89 +377,11 @@ class WorkersMgr:
 
                     last_seen = self.tm.get_worker_last_seen(job_worker_id)
                     print("LAST SEEN FOR WORKER {} is {} ".format(job_worker_id, last_seen))
-                    if time.time() - float(last_seen) > WorkersMgr.WORKER_DEAD_TIMEOUT:
+                    ## CHECK WORKER_DEAD_TIMEOUT + activejob timeout too calculation
+                    if time.time() - float(last_seen) > WorkersMgr.WORKER_DEAD_TIMEOUT: 
                         print("WORKER {} is dead".format(job.worker_id))
                         job = self.tm.prepare_to_reschedule(job)
                         self.tm.schedule(job)
             sleep(1)
 
-def produce():
-    q = TaskQueueManager()
-
-    def longfn1():
-        sleep(1)
-        return "ok"
-    bglongfn1 = new_job(longfn1)
-    q.schedule(bglongfn1)
-
-    def longfn2(username, lang="en"):
-        sleep(0)
-        print("hi ", username, lang)
-        return username, lang
-
-    # # bglongfn2 = new_job(longfn2)
-    q.schedule_fun(longfn2, username="ahmed", lang="en")
-    q.schedule_fun(longfn2, username="dmdm", lang="ar")
-
-    def fail1():
-        sleep(1)
-        raise ValueError("errr")
-    
-    q.schedule_fun(fail1)
-
-    # def fail2Timeout():
-    #     sleep(5)
-
-    # failingjob1 = new_job(fail2Timeout)
-    # failingjob1.timeout = 1
-    # q.schedule(failingjob1)
-
-
-    # def fail3Timeout():
-    #     for i in range(5):
-    #         print("a very long job")
-    #         sleep(1)
-
-    # failingjob2 = new_job(fail3Timeout)
-    # failingjob2.timeout = 40
-    # failingjob2.in_process = True
-    # failingjob2.memoized = False
-    # q.schedule(failingjob2)
-
-
-if __name__ == "__main__":
-    tm = TaskQueueManager()
-
-    argv = sys.argv
-    if argv[1] == "producer":
-        count = 100
-        if len(argv) > 2:
-            count = int(argv[2])
-        for i in range(count):
-            produce()
-    elif argv[1] == "producemany":
-        count = 100
-        if len(argv) > 2:
-            count = int(argv[2])
-        for i in range(count):
-            produce()
-            sleep(1)
-    elif argv[1] == "worker":
-        wm = WorkersMgr(GeventWorker, tm)
-        nworkers = 4
-        if len(argv) > 2:
-            nworkers = argv[2]
-        futures = []
-        for w in range(int(nworkers)):
-            f = wm.start_new_worker()
-            futures.append(f)
-        g.joinall(futures, raise_error=False)
-    elif argv[1] == "clean":
-        q.r.flushall()
-    elif argv[1] == "info":
-        jobskeys = tm.get_all_jobs_keys()
-        print("Jobs: ", len(jobskeys))
-        print("Job #\t\t\t\t\t\t State\t\t Retries ")
-        for jobkey in jobskeys:
-            job = tm.job_get(jobkey)
-            print(job.job_key, "\t", job.state, "\t\t", job.retries)
+tm = TaskQueueManager()
